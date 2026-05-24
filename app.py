@@ -7,10 +7,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor  # 멀티스레딩 추가
 
 
 def fetch_yogiyo_html(target_address, category_name):
     chrome_options = Options()
+    chrome_options.add_argument("--headless")  # 속도 향상을 위해 백그라운드 실행 추가
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -51,13 +53,13 @@ def fetch_yogiyo_html(target_address, category_name):
 
         return driver.page_source
     except Exception as e:
-        st.error(f"에러 발생: {e}")
         return None
     finally:
         driver.quit()
 
 
 def extract_store_details(html, category_name):
+    if not html: return []
     soup = BeautifulSoup(html, "html.parser")
     stores_data = []
     restaurant_items = soup.find_all("table", class_="item")
@@ -82,19 +84,31 @@ def extract_store_details(html, category_name):
 
 
 def main():
-    st.title("요기요 데이터 수집기 (기본형)")
+    st.title("요기요 데이터 수집기 (고속 병렬형)")
     address_input = st.text_input("주소지 입력:", value="부산광역시 금정구 부산대학로63번길 2")
 
-    if st.button("크롤링 시작"):
+    if st.button("병렬 크롤링 시작"):
         categories = ["치킨", "피자/양식", "중국집"]
+
+        st.info("3대 업종 동시 수집 중... (ThreadPoolExecutor 가동)")
+
+        # 멀티스레드로 3개 카테고리 동시에 긁어오기
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            html_results = list(executor.map(lambda cat: fetch_yogiyo_html(address_input, cat), categories))
+
         all_stores = []
-        for cat in categories:
-            html = fetch_yogiyo_html(address_input, cat)
-            if html:
-                all_stores.extend(extract_store_details(html, cat))
+        for cat, html in zip(categories, html_results):
+            all_stores.extend(extract_store_details(html, cat))
 
         df = pd.DataFrame(all_stores)
-        st.dataframe(df)
+
+        # 중복 제거 로직 추가
+        if not df.empty:
+            df = df.drop_duplicates(subset=["가게명", "카테고리"]).reset_index(drop=True)
+            st.success(f"총 {len(df)}개의 유니크한 가게 수집 완료!")
+            st.dataframe(df)
+        else:
+            st.warning("수집된 데이터가 없습니다.")
 
 
 if __name__ == "__main__":
