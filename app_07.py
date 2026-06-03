@@ -12,16 +12,22 @@ import time
 import re
 import concurrent.futures
 import plotly.express as px
+import plotly.graph_objects as go  # 통합 추세선을 커스텀 레이어로 추가하기 위해 도입
 import io  # 메모리 버퍼 활용을 위한 모듈
 
 
 def fetch_yogiyo_html(target_address, category_name):
     """
     지정된 주소와 카테고리에 대해 요기요에서 HTML 소스를 가져오는 함수 (멀티스레드 대응)
+    ★ 창 크기 축소로 인한 모바일 모드(리스트 멈춤 현상) 방지를 위해 PC 화면 강제 최대화 옵션 적용
     """
     chrome_options = Options()
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+
+    # [중요 보완] 새 창이 뜰 때 모니터 화면 크기로 최대화하여 PC 버전 UI 유지 (모바일 전환 방지)
+    chrome_options.add_argument("--start-maximized")
+
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -117,10 +123,28 @@ def fetch_yogiyo_html(target_address, category_name):
         except:
             pass
 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
-        time.sleep(2)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        # ---------------------------------------------------------------------
+        # 목표치(200개) 기반 스마트 무한 스크롤 연동
+        # ---------------------------------------------------------------------
+        TARGET_COUNT = 200
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        scroll_attempts = 0
+
+        while scroll_attempts < 25:
+            current_loaded_stores = driver.find_elements(By.CLASS_NAME, "restaurant-name")
+            if len(current_loaded_stores) >= TARGET_COUNT:
+                break
+
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(3)
+
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+
+            last_height = new_height
+            scroll_attempts += 1
+        # ---------------------------------------------------------------------
 
         html = driver.page_source
         driver.quit()
@@ -200,21 +224,38 @@ def main():
     default_address = "부산광역시 금정구 부산대학로63번길 2"
     address_input = st.text_input("데이터를 수집할 대상 주소지 입력:", value=default_address, key="address_input")
 
-    # 버튼과 선택/해제 가능한 '이상치 제거' 토글 가로 정렬 배치
-    col1, col2, col3 = st.columns([1.2, 1.8, 3])
+    st.markdown("---")
+    st.subheader("⚙️ 데이터 정제 방식 선택")
 
-    with col1:
-        start_button = st.button("통합 크롤링 시작")
-    with col2:
-        remove_outliers = st.checkbox("이상치 제거 (리뷰 30개 이하 제외)", value=False)
+    col_filter, col_input, col_btn = st.columns([2.5, 2, 1.5])
 
-    # 크롤링 시작 버튼을 누르면 새로운 데이터를 수집하여 세션 스테이트에 박제
+    with col_filter:
+        filter_option = st.radio(
+            "데이터 정제 옵션:",
+            ["리뷰 30개 이하 제외", "정제할 최소 리뷰 수 직접 입력"],
+            key="filter_option"
+        )
+
+    with col_input:
+        if filter_option == "리뷰 30개 이하 제외":
+            review_threshold = 30
+            st.number_input("제외할 리뷰 수 기준:", value=30, disabled=True, key="threshold_disabled")
+        else:
+            review_threshold = st.number_input("제외할 리뷰 수 기준:", min_value=0, value=30, step=5, key="threshold_enabled")
+
+        st.caption("⚠️ *입력한 숫자 이하의 리뷰 수의 가게는 통계되지 않습니다.*")
+
+    with col_btn:
+        st.write("")
+        st.write("")
+        start_button = st.button("🚀 통합 크롤링 및 정제 시작", use_container_width=True)
+
     if start_button:
         if not address_input.strip():
             st.warning("주소를 입력해 주세요.")
             return
 
-        st.info("🔥 멀티스레딩(병렬 처리) 가동! 3개의 독립 브라우저가 개별 기동됩니다. (약 15~20초 소요)")
+        st.info("🔥 멀티스레딩(병렬 처리) 가동! 전체 화면 PC 모드로 3개의 브라우저가 안전하게 크롤링을 시작합니다.")
 
         categories_to_crawl = ["치킨", "피자/양식", "중국집"]
         all_combined_stores = []
@@ -233,32 +274,39 @@ def main():
             df_result = pd.DataFrame(all_combined_stores)
             df_result = df_result.drop_duplicates(subset=["가게명"], keep="first")
 
-            # 수집 완료된 원본 데이터를 세션에 박제
             st.session_state.combined_df = df_result
             st.session_state.has_data = True
 
-    # 다운로드 버튼 클릭 등으로 재실행되어도 세션에 데이터가 살아있다면 화면을 계속 유지함
     if st.session_state.get("has_data", False):
-        df_display = st.session_state.combined_df.copy()
+        df_raw = st.session_state.combined_df.copy()
 
-        # 이상치 제거 활성화 여부에 따른 실시간 필터링 분기
-        if remove_outliers:
-            df_display = df_display[df_display["리뷰 수"] > 30]
-            st.success(f"🎉 데이터 로드 및 이상치 제거 완료! (리뷰 30개 이하 제외) 총 {len(df_display)}곳의 매장을 표시 중입니다.")
+        # 리뷰 수가 0인 곳은 분석 대상에서 완전히 제외 (결측치 제거)
+        df_raw = df_raw[df_raw["리뷰 수"] > 0]
+
+        # 사용자가 지정한 임계값 필터링 적용
+        if review_threshold > 0:
+            df_display = df_raw[df_raw["리뷰 수"] > review_threshold]
+            st.success(f"🎉 데이터 로드 완료! (리뷰 {review_threshold}개 이하 제외 후 총 {len(df_display)}곳의 매장 분석 중)")
         else:
-            st.success(f"🎉 데이터 로드 완료! (리뷰 30개 이하 포함) 총 {len(df_display)}곳의 매장을 표시 중입니다.")
+            df_display = df_raw.copy()
+            st.success(f"🎉 데이터 로드 완료! (총 {len(df_display)}곳의 매장 분석 중)")
 
         df_sorted = df_display.sort_values(by=["별점", "리뷰 수"], ascending=False).reset_index(drop=True)
         df_sorted.index = df_sorted.index + 1
 
+        # 1단계. 데이터 수집 결과 표출
+        st.subheader("📋 정제 및 필터링 완료된 데이터 테이블")
         st.dataframe(df_sorted, use_container_width=True)
 
+        # 2단계. 산점도 출력
         st.subheader("📊 리뷰 수(자연로그 변환)와 별점의 산점도")
 
-        # X축 보정: 리뷰 수 컬럼 전체에 수학적 자연로그 ln(x+1) 일괄 주입
         df_sorted["리뷰 수 (자연로그 변환)"] = np.log1p(df_sorted["리뷰 수"])
 
-        # 산점도 차트 생성
+        # 추세선 활성화 제어 체크박스
+        show_trendline = st.checkbox("🎯 산점도에 통합 추세선 표시하기 (진한 검은색 실선)", value=True)
+
+        # 기본 산점도 빌드
         fig = px.scatter(
             df_sorted,
             x="리뷰 수 (자연로그 변환)",
@@ -266,17 +314,38 @@ def main():
             color="카테고리",
             hover_name="가게명",
             labels={"리뷰 수 (자연로그 변환)": "리뷰 수 [자연로그 변환축]", "별점": "평점 (별점)"},
-            title="상권 내 업종별 평점 및 리뷰 분포 현황 (X축 로그 스케일링 & 규격 구속 버전)"
+            title="상권 내 업종별 평점 및 리뷰 분포 현황 (통합 회귀 분석선 포함)"
         )
 
-        # 평점 축 규격 제한: 5.0 상한선 고정
-        fig.update_yaxes(
-            range=[0.0, 5.0],
-            tickvals=[0, 1, 2, 3, 4, 5],
-            constrain="domain"
-        )
+        # 업종 구분 없이 통합된 '진한 검은색 실선' 추세선 최상단 추가 로직
+        if show_trendline and len(df_sorted) > 1:
+            x_vals = df_sorted["리뷰 수 (자연로그 변환)"]
+            y_vals = df_sorted["별점"]
 
-        # 리뷰 수 축 규격 제한: 최대 10,000개 위치 제한
+            # 1차 선형회귀 선 기울기 및 절편 계산
+            slope, intercept = np.polyfit(x_vals, y_vals, 1)
+
+            # 추세선 범위 지정
+            x_trend = np.linspace(x_vals.min(), x_vals.max(), 100)
+            y_trend = slope * x_trend + intercept
+
+            # Plotly 차트에 통합 검은색 실선 레이어 추가
+            fig.add_trace(
+                go.Scatter(
+                    x=x_trend,
+                    y=y_trend,
+                    mode="lines",
+                    name="통합 추세선 (전체 업종)",
+                    line=dict(color="black", width=4.5),  # 가시성을 위해 두께를 대폭 두껍게 고정
+                    hovertemplate="통합 추세선 예측 평점: %{y:.2f}<extra></extra>"
+                )
+            )
+
+            # 레이아웃 설정을 통해 추세선이 마커(데이터 점) 위로 올라오도록 보정
+            fig.update_layout(scattermode="group")
+
+        fig.update_yaxes(range=[0.0, 5.0], tickvals=[0, 1, 2, 3, 4, 5], constrain="domain")
+
         max_log_limit = np.log1p(10000)
         fig.update_xaxes(
             type="linear",
@@ -294,57 +363,88 @@ def main():
                 "리뷰 로그변환 값: %{x:.2f}",
                 "실제 리뷰 수: %{customdata}개",
                 "별점: %{y:.1f}"
-            ])
+            ]),
+            selector=dict(mode='markers')
         )
 
-        fig.update_layout(
-            height=650,
-            hovermode="closest",
-            legend_title_text="업종 분류",
-            template="plotly_white"
-        )
-
-        # 웹 화면에 차트 노출 유지
+        fig.update_layout(height=650, hovermode="closest", legend_title_text="분류 레이블", template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
 
-        # 산점도 차트를 독립형 HTML 파일 바이너리로 변환
-        html_buffer = io.StringIO()
-        fig.write_html(html_buffer, include_plotlyjs='cdn')
-        html_bytes = html_buffer.getvalue().encode('utf-8')
+        # 3단계. 리뷰 수 기준 집단 분할 후 별점 히스토그램 생성
+        st.markdown("---")
+        st.subheader("📈 리뷰 수 규모별 별점 분포 히스토그램 비교 (구간: 0.5 단위)")
 
-        # 다운로드 버튼 레이아웃 배치
+        df_under_30 = df_raw[df_raw["리뷰 수"] <= 30]
+        df_over_30 = df_raw[df_raw["리뷰 수"] > 30]
+
+        hist_col1, hist_col2 = st.columns(2)
+
+        with hist_col1:
+            st.write(f"**① 리뷰 수 30개 '이하' 매장 분포 (총 {len(df_under_30)}곳)**")
+            if not df_under_30.empty:
+                fig_hist1 = px.histogram(
+                    df_under_30,
+                    x="별점",
+                    nbins=10,
+                    range_x=[0.8, 5.2],
+                    labels={"별점": "평점"},
+                    color_discrete_sequence=['#FF6F61'],
+                    template="plotly_white"
+                )
+                fig_hist1.update_traces(xbins=dict(start=1.0, end=5.0, size=0.5))
+                fig_hist1.update_xaxes(tickvals=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0])
+                st.plotly_chart(fig_hist1, use_container_width=True)
+            else:
+                st.info("조건에 해당하는 매장이 없습니다.")
+
+        with hist_col2:
+            st.write(f"**② 리뷰 수 30개 '초과' 매장 분포 (총 {len(df_over_30)}곳)**")
+            if not df_over_30.empty:
+                fig_hist2 = px.histogram(
+                    df_over_30,
+                    x="별점",
+                    nbins=10,
+                    range_x=[0.8, 5.2],
+                    labels={"별점": "평점"},
+                    color_discrete_sequence=['#4A90E2'],
+                    template="plotly_white"
+                )
+                fig_hist2.update_traces(xbins=dict(start=1.0, end=5.0, size=0.5))
+                fig_hist2.update_xaxes(tickvals=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0])
+                st.plotly_chart(fig_hist2, use_container_width=True)
+            else:
+                st.info("조건에 해당하는 매장이 없습니다.")
+
+        # 다운로드 레이아웃
+        st.markdown("---")
         dl_col1, dl_col2 = st.columns(2)
 
         with dl_col1:
             csv_data = df_sorted.drop(columns=["리뷰 수 (자연로그 변환)"]).to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📁 중복 없는 통합 마스터 엑셀(CSV) 다운로드",
+                label="📁 마스터 데이터(CSV) 다운로드",
                 data=csv_data,
-                file_name="요기요_3대업종_순수매장_통합마스터.csv",
+                file_name="요기요_수집자료_통합마스터.csv",
                 mime="text/csv"
             )
 
         with dl_col2:
+            html_buffer = io.StringIO()
+            fig.write_html(html_buffer, include_plotlyjs='cdn')
+            html_bytes = html_buffer.getvalue().encode('utf-8')
             st.download_button(
                 label="📊 상관관계 산점도 그래프(HTML) 다운로드",
                 data=html_bytes,
-                file_name="요기요_상관관계_산점도_그래프.html",
+                file_name="요기요_상관관계_산점도.html",
                 mime="text/html"
             )
 
-        # =========================================================================
-        # ✨ [신규 추가 기능] 추출된 데이터와 산점도 축에 기반한 통계적 수치 계산 섹션
-        # =========================================================================
-        st.markdown("---")
-        st.subheader("📉 산점도 변인 기준 통계 분석 결과 (상관계수 및 결정계수)")
+        # 4단계. 최종 통계 분석 결과 표출
+        st.subheader("📉 최종 통계 분석 결과 (상관계수 및 결정계수)")
 
         if len(df_sorted) > 1:
-            # 1. 피어슨 상관계수 (r) 계산
-            # 실제 산점도에 맵핑된 축 데이터인 '리뷰 수 (자연로그 변환)'와 '별점' 간의 관계를 분석합니다.
             correlation = df_sorted["리뷰 수 (자연로그 변환)"].corr(df_sorted["별점"])
 
-            # 2. 결정계수 (R²) 계산
-            # numpy.polyfit 선형 관계 추정 로직을 활용해 잔차 제곱합 계산 후 유도
             x_stat = df_sorted["리뷰 수 (자연로그 변환)"]
             y_stat = df_sorted["별점"]
 
@@ -356,24 +456,23 @@ def main():
             ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
             r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
 
-            # 사용자 UI 대시보드 카드 배치
             stat_col1, stat_col2 = st.columns(2)
             with stat_col1:
                 st.metric(label="🔗 피어슨 상관계수 (r)", value=f"{correlation:.4f}")
                 if abs(correlation) >= 0.7:
-                    st.write("💡 **해석:** 산점도 상에서 두 변인 간에 매우 강한 상관성이 확인됩니다.")
+                    st.write("💡 **해석:** 두 변인 간에 매우 강한 선형적 상관성이 확인됩니다.")
                 elif abs(correlation) >= 0.4:
-                    st.write("💡 **해석:** 산점도 상에서 두 변인 간에 다소 유의미한 상관성이 확인됩니다.")
+                    st.write("💡 **해석:** 두 변인 간에 다소 유의미한 선형적 상관성이 확인됩니다.")
                 elif abs(correlation) >= 0.1:
-                    st.write("💡 **해석:** 산점도 상에서 두 변인 간에 약한 상관성이 확인됩니다.")
+                    st.write("💡 **해석:** 두 변인 간에 약한 선형적 상관성이 확인됩니다.")
                 else:
-                    st.write("💡 **해석:** 산점도 상에서 두 변인 간에 선형적 상관관계를 찾기 어렵습니다.")
+                    st.write("💡 **해석:** 두 변인 간에 통계적인 선형 상관관계를 정의하기 어렵습니다.")
 
             with stat_col2:
                 st.metric(label="🎯 결정계수 (R²)", value=f"{r_squared:.4f}")
-                st.write(f"💡 **해석:** 독립변수(리뷰 수 로그값)가 평점 변동성을 약 **{r_squared * 100:.2f}%** 만큼 설명할 수 있음을 의미합니다.")
+                st.write(f"💡 **해석:** 리뷰 수 로그값이 평점의 변동성을 약 **{r_squared * 100:.2f}%** 만큼 설명할 수 있습니다.")
         else:
-            st.warning("데이터가 부족하여 상관분석을 수행할 수 없습니다.")
+            st.warning("분석 데이터 수가 부족하여 상관분석 결과 산출이 불가능합니다.")
 
 
 if __name__ == "__main__":
